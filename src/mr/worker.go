@@ -1,10 +1,36 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
+import (
+	"errors"
+	"fmt"
+	"hash/fnv"
+	"io/ioutil"
+	"log"
+	"net/rpc"
+	"os"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+)
 
+type Counter struct {
+	wg sync.WaitGroup
+}
+
+func NewCounter(n int) *Counter {
+	c := &Counter{}
+	c.wg.Add(n)
+	return c
+}
+
+func (c *Counter) Done() {
+	c.wg.Done()
+}
+
+func (c *Counter) Wait() {
+	c.wg.Wait()
+}
 
 //
 // Map functions return a slice of KeyValue.
@@ -13,6 +39,14 @@ type KeyValue struct {
 	Key   string
 	Value string
 }
+
+// for sorting by key.
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 //
 // use ihash(key) % NReduce to choose the reduce
@@ -30,12 +64,168 @@ func ihash(key string) int {
 //
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
-
 	// Your worker implementation here.
-
+	for {
+		err := GetTask(mapf, reducef)
+		if err != nil {
+			break
+		}
+	}
 	// uncomment to send the Example RPC to the coordinator.
 	// CallExample()
+}
 
+func GetTask(mapf func(string, string) []KeyValue, reducef func(string, []string) string) error {
+	emptyArgs := EmptyRequest{}
+	EmptyReply := EmptyReply{}
+	args := Request{}
+	reply := Reply{}
+	ok := call("Coordinator.AssignTask", &emptyArgs, &reply)
+	if !ok {
+		return errors.New("error getting task")
+	}
+	if reply.Status == Map {
+		runMap(mapf, &reply)
+		args = Request{Status: Map, WorkerId: reply.WorkerId}
+		ok := call("Coordinator.FinishTask", &args, &EmptyReply)
+		if !ok {
+			return errors.New("error finishing map task")
+		} 
+	} else if reply.Status == Reduce {
+		runReduce(reducef, &reply)
+		args = Request{Status: Reduce, WorkerId: reply.WorkerId}
+		ok := call("Coordinator.FinishTask", &args, &EmptyReply)
+		if !ok {
+			return errors.New("error finishing reduce task")
+		} 
+	} else if reply.Status == Wait {
+		time.Sleep(time.Second)	
+	} else {
+		os.Exit(0)
+	}
+	return nil;
+}
+
+func runMap(mapf func(string, string) []KeyValue, reply *Reply) {
+	file, err := os.Open(reply.Filename)
+	if err != nil {
+		log.Fatalf("cannot open map %v", reply.Filename)
+	}
+	content, err := ioutil.ReadAll(file)
+	if err != nil {
+		log.Fatalf("cannot read %v", reply.Filename)
+	}
+	file.Close()
+	intermediate := make([][]KeyValue, reply.NReduce)
+	temp := mapf(reply.Filename, string(content))
+	//
+	// a big difference from real MapReduce is that all the
+	// intermediate data is in one place, intermediate[],
+	// rather than being partitioned into NxM buckets.
+	//
+
+	sort.Sort(ByKey(temp))
+
+	//
+	// call Reduce on each distinct key in intermediate[],
+	// and print the result to mr-out-0.
+	//
+	i := 0
+	for i < len(temp) {
+		j := i + 1
+		for j < len(temp) && temp[j].Key == temp[i].Key {
+			j++
+		}
+		key := ihash(temp[i].Key) % reply.NReduce
+		for k := i; k < j; k++ {
+			intermediate[key] = append(intermediate[key], KeyValue{temp[k].Key, temp[k].Value})
+		}
+		i = j
+	}
+
+	counter := NewCounter(reply.NReduce)
+	for i := 0; i < reply.NReduce; i++ {
+		go func(idx int) {
+			oname := fmt.Sprintf("mr-%v-%v", reply.WorkerId, idx)
+			ofile, err := os.OpenFile(oname, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+			if err != nil {
+				fmt.Println("Error opening file:", err)
+				return
+			}
+			for i := 0; i < len(intermediate[idx]); i++ {
+				fmt.Fprintf(ofile, "%v %v\n", intermediate[idx][i].Key, intermediate[idx][i].Value)
+			}
+			counter.Done()
+		}(i)
+	}
+	counter.Wait()
+}
+
+func runReduce(reducef func(string, []string) string, reply *Reply) {
+	intermediate := []KeyValue{}
+	counter := NewCounter(reply.NMap)
+	var mu sync.Mutex
+
+	for i := 0; i < reply.NMap; i++ {
+		go func(idx int) {
+			filename := fmt.Sprintf("mr-%v-%v", idx, reply.WorkerId)
+
+			file, err := os.Open(filename)
+			if err != nil {
+				log.Fatalf("cannot open file of %v: %v", filename, err)
+			}
+			defer file.Close()
+
+			content, err := ioutil.ReadAll(file)
+			if err != nil {
+				log.Fatalf("cannot read %v: %v", filename, err)
+			}
+
+			lines := strings.Split(string(content), "\n")
+			if len(lines) > 0 && lines[len(lines)-1] == "" {
+				lines = lines[:len(lines)-1]
+			}
+
+			mu.Lock()
+			for _, line := range lines {
+				kv := strings.Split(line, " ")
+				if len(kv) == 2 {
+					intermediate = append(intermediate, KeyValue{kv[0], kv[1]})
+				}
+			}
+			mu.Unlock()
+			counter.Done()
+		}(i)
+	}
+
+	counter.Wait()
+
+	sort.Sort(ByKey(intermediate))
+	oname := fmt.Sprintf("mr-out-%v", reply.WorkerId)
+	ofile, err := os.Create(oname)
+	if err != nil {
+		log.Fatalf("cannot create %v: %v", oname, err)
+	}
+	defer ofile.Close()
+	
+
+	i := 0
+	for i < len(intermediate) {
+		j := i + 1
+		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, intermediate[k].Value)
+		}
+		output := reducef(intermediate[i].Key, values)
+
+		// This is the correct format for each line of Reduce output.
+		fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
+
+		i = j
+	}
 }
 
 //
